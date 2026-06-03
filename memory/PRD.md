@@ -33,9 +33,13 @@ Build a frontend-first Mood Wellness Audio Therapy app with a 3-step wizard (Moo
 - Aurora-mesh ambient backdrop + grain noise overlay
 - Internet Archive (archive.org) audio integration — real public-domain ambient music
 - Backend API contract ported from Node/Express to Python FastAPI:
-  - `POST /api/music-wellness/generate` (Node test contract) — validation envelope `{error: 'ValidationError', message}`, intensityBucket logic (1-2→low, 3-5→high), search queries + tags per mood
+  - `POST /api/music-wellness/generate` (Node test contract) — validation envelope `{error: 'ValidationError', message}`, intensityBucket logic (1-2→low, 3-5→high), search queries + tags per mood, `musicPreferences[]` flow into scoring
   - `POST /api/playlist` (frontend wizard) — exposes both `url` and `audioUrl` for compatibility
   - `GET /api/catalog` — moods/intensities/durations metadata
+- `PlaylistBuilder` ported from Node `src/utils/playlistBuilder.ts`:
+  - `score_track / scoreTrack`: +30 per subject ∈ targetTags, +15 per targetTag in title, +25 per user-pref in title (case-insensitive)
+  - `build_session_playlist / buildSessionPlaylist`: greedy score-first pack into `session_minutes * 60` budget
+  - Safety net: if budget excludes all candidates, fall back to top-2 highest-scored tracks
 - 30-min in-memory cache (non-empty results only) + SoundHelix fallback if archive.org is unreachable
 - Full data-testid coverage
 
