@@ -17,6 +17,7 @@ from mood_mappings import (
     FRONTEND_INTENSITY_TO_NUMBER,
 )
 from audio_archive_service import archive_service, WellnessTrack
+from playlist_builder import PlaylistBuilder
 
 
 ROOT_DIR = Path(__file__).parent
@@ -96,10 +97,16 @@ def _validation_error(detail: str) -> HTTPException:
 
 
 async def _generate_tracks(
-    mood_name: str, intensity: int, session_duration: int
+    mood_name: str,
+    intensity: int,
+    session_duration: int,
+    music_preferences: Optional[List[str]] = None,
 ) -> tuple[list[TrackOut], dict]:
-    """Resolve mood + intensity → archive.org tracks. Falls back to a deterministic
-    pool if archive.org returns nothing so the UI is never left empty."""
+    """Resolve mood + intensity → archive.org pool → score & assemble within budget.
+
+    Falls back to a deterministic pool if archive.org returns nothing so the UI
+    is never left empty.
+    """
     mood_cfg = MOOD_INTENSITY_MAP.get(mood_name)
     if mood_cfg is None:
         raise _validation_error(
@@ -109,18 +116,35 @@ async def _generate_tracks(
     context = mood_cfg[bucket]
     search_query = context["searchQuery"]
     target_tags = list(context["targetTags"])
+    preferences = list(music_preferences or [])
 
-    # ~6 minutes per ambient track on average — round to keep playlist tight
-    n = max(2, min(6, round(session_duration / 5)))
+    pool = await archive_service.fetch_wellness_pool(search_query, limit=15)
 
-    tracks: list[WellnessTrack] = await archive_service.fetch_wellness_tracks(
-        search_query, limit=n
-    )
-    if not tracks:
-        tracks = _fallback_tracks(mood_name, intensity, n)
+    selected: list[WellnessTrack] = []
+    if pool:
+        # PlaylistBuilder: score, sort desc, greedily pack into session budget
+        selected = PlaylistBuilder.build_session_playlist(
+            pool, session_duration, target_tags, preferences
+        )
+
+        # Safety net: if budget excluded everything (e.g. all tracks too long),
+        # take the highest-scoring 2 from the pool so the UI is never empty.
+        if not selected:
+            scored = sorted(
+                (
+                    (PlaylistBuilder.score_track(it["doc"], it["subjects"], target_tags, preferences), it["doc"])
+                    for it in pool
+                ),
+                key=lambda x: x[0],
+                reverse=True,
+            )
+            selected = [doc for _, doc in scored[:2]]
+
+    if not selected:
+        selected = _fallback_tracks(mood_name, intensity, max(2, min(6, round(session_duration / 5))))
 
     return (
-        [TrackOut(**t.to_dict() if isinstance(t, WellnessTrack) else t) for t in tracks],
+        [TrackOut(**(t.to_dict() if isinstance(t, WellnessTrack) else t)) for t in selected],
         {"searchQuery": search_query, "targetTags": target_tags, "bucket": bucket},
     )
 
@@ -165,7 +189,9 @@ async def get_catalog():
 async def music_wellness_generate(req: WellnessGenerateRequest):
     """Backend contract endpoint (ported from the Node/Express reference)."""
     _validate_intensity(req.intensity)
-    tracks, ctx = await _generate_tracks(req.currentMood, req.intensity, req.sessionDuration)
+    tracks, ctx = await _generate_tracks(
+        req.currentMood, req.intensity, req.sessionDuration, req.musicPreferences
+    )
     return WellnessGenerateResponse(
         sessionId=str(uuid.uuid4()),
         currentMood=req.currentMood,

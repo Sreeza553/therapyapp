@@ -111,7 +111,7 @@ class AudioArchiveService:
         )
         return {
             "q": scoped_q,
-            "fl[]": ["identifier", "title", "creator", "runtime"],
+            "fl[]": ["identifier", "title", "creator", "runtime", "subject"],
             "rows": rows,
             "page": 1,
             "output": "json",
@@ -136,18 +136,25 @@ class AudioArchiveService:
     async def fetch_wellness_tracks(
         self, query: str, limit: int = 6
     ) -> list[WellnessTrack]:
-        cache_key = hashlib.md5(f"{query}|{limit}".encode()).hexdigest()
+        pool = await self.fetch_wellness_pool(query, limit=limit)
+        return [item["doc"] for item in pool]
+
+    async def fetch_wellness_pool(
+        self, query: str, limit: int = 15
+    ) -> list[dict]:
+        """Fetch a scoring-ready pool: list of {'doc': WellnessTrack, 'subjects': [str]}."""
+        cache_key = hashlib.md5(f"pool|{query}|{limit}".encode()).hexdigest()
         cached = self._cache.get(cache_key)
         if cached:
-            log.info("audio-archive cache hit: %s", query)
-            return cached
+            log.info("audio-archive pool cache hit: %s", query)
+            return cached  # type: ignore[return-value]
 
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             # Step 1 — advanced search
             try:
                 resp = await client.get(
                     ARCHIVE_SEARCH_URL,
-                    params=self._build_search_params(query, rows=max(limit * 4, 12)),
+                    params=self._build_search_params(query, rows=max(limit * 2, 20)),
                 )
                 resp.raise_for_status()
                 docs = (resp.json() or {}).get("response", {}).get("docs", []) or []
@@ -155,8 +162,7 @@ class AudioArchiveService:
                 log.warning("archive.org search failed for '%s': %s", query, e)
                 return []
 
-            # Step 2 — fetch file lists per candidate, in parallel
-            async def hydrate(doc: dict) -> Optional[WellnessTrack]:
+            async def hydrate(doc: dict) -> dict | None:
                 ident = doc.get("identifier")
                 if not ident:
                     return None
@@ -179,27 +185,33 @@ class AudioArchiveService:
                     creator = ", ".join(str(c) for c in creator) if creator else None
                 artist = creator or file_obj.get("creator") or "Internet Archive"
 
-                length_str = (
-                    file_obj.get("length")
-                    or doc.get("runtime")
-                    or ""
-                )
+                length_str = file_obj.get("length") or doc.get("runtime") or ""
                 duration = parse_length_to_seconds(length_str)
 
+                subj = doc.get("subject")
+                if isinstance(subj, str):
+                    subjects = [s.strip() for s in subj.split(";") if s.strip()]
+                elif isinstance(subj, list):
+                    subjects = [str(s).strip() for s in subj if str(s).strip()]
+                else:
+                    subjects = []
+
                 audio_url = f"{ARCHIVE_DOWNLOAD_URL}/{ident}/{file_obj.get('name')}"
-                return WellnessTrack(
+                track = WellnessTrack(
                     id=f"ia_{ident}",
                     title=str(title)[:120],
                     artist=str(artist)[:80],
                     duration=duration,
                     audioUrl=audio_url,
                 )
+                return {"doc": track, "subjects": subjects}
 
-            results = await asyncio.gather(*(hydrate(d) for d in docs[: max(limit * 3, 10)]))
-            tracks = [t for t in results if t is not None][:limit]
+            results = await asyncio.gather(*(hydrate(d) for d in docs[: max(limit * 2, 20)]))
+            pool = [r for r in results if r is not None][:limit]
 
-        self._cache.set(cache_key, tracks) if tracks else None
-        return tracks
+        if pool:
+            self._cache.set(cache_key, pool)  # type: ignore[arg-type]
+        return pool
 
 
 # Module-level singleton

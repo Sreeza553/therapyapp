@@ -184,3 +184,137 @@ class TestParseLengthHelper:
     def test_hh_mm_ss(self):
         from audio_archive_service import parse_length_to_seconds
         assert parse_length_to_seconds("01:02:03") == 3723
+
+
+# ---------- PlaylistBuilder (Node parity contract) ----------
+
+class TestPlaylistBuilder:
+    """Direct unit tests for the ported playlist scoring/assembly logic."""
+
+    def test_score_track_exact_85_contract(self):
+        from playlist_builder import PlaylistBuilder
+        from audio_archive_service import WellnessTrack
+
+        track = WellnessTrack(
+            id="archive_track_01",
+            title="Deep Ambient Meditation Bliss",
+            artist="Wellness Producer",
+            duration=300,
+            audioUrl="https://archive.org/download/x/x.mp3",
+        )
+        # subject 'meditation' is in target_tags (+30); 'calm' is not (+0)
+        # 'meditation' in title (+15), 'ambient' in title (+15)
+        # user pref 'Ambient' substring in title (+25) → total 85
+        score = PlaylistBuilder.score_track(
+            track,
+            subjects=["meditation", "calm"],
+            target_tags=["meditation", "ambient"],
+            user_preferences=["Ambient"],
+        )
+        assert score == 85
+
+    def test_score_track_camelcase_alias_works(self):
+        from playlist_builder import PlaylistBuilder
+        from audio_archive_service import WellnessTrack
+
+        track = WellnessTrack("id1", "Deep Ambient Meditation Bliss", "x", 300, "u")
+        score_snake = PlaylistBuilder.score_track(
+            track, ["meditation", "calm"], ["meditation", "ambient"], ["Ambient"]
+        )
+        score_camel = PlaylistBuilder.scoreTrack(
+            track, ["meditation", "calm"], ["meditation", "ambient"], ["Ambient"]
+        )
+        assert score_snake == score_camel == 85
+
+    def test_build_session_playlist_picks_highest_within_budget(self):
+        from playlist_builder import PlaylistBuilder
+        from audio_archive_service import WellnessTrack
+
+        # Contract pool: 1 highly-scoring 300s track + 1 unrelated 180s clip
+        mock_item = WellnessTrack(
+            id="archive_track_01",
+            title="Deep Ambient Meditation Bliss",
+            artist="Wellness Producer",
+            duration=300,
+            audioUrl="https://archive.org/download/x/x.mp3",
+        )
+        short_clip = WellnessTrack(
+            id="short_clip",
+            title="Relax Short",
+            artist="Other",
+            duration=180,
+            audioUrl="https://archive.org/download/y/y.mp3",
+        )
+        raw_pool = [
+            {"doc": mock_item, "subjects": ["meditation"]},
+            {"doc": short_clip, "subjects": ["relax"]},
+        ]
+        # session_minutes=5 → 300s budget. highest-scoring track (300s) fits exactly,
+        # consumes whole budget → only 1 track in output
+        out = PlaylistBuilder.build_session_playlist(
+            raw_pool,
+            session_minutes=5,
+            target_tags=["meditation"],
+            user_preferences=["Ambient"],
+        )
+        assert len(out) == 1
+        assert out[0].id == "archive_track_01"
+
+    def test_build_session_playlist_camelcase_alias(self):
+        from playlist_builder import PlaylistBuilder
+        from audio_archive_service import WellnessTrack
+
+        item = WellnessTrack("archive_track_01", "Deep Ambient Meditation Bliss", "x", 300, "u")
+        raw_pool = [{"doc": item, "subjects": ["meditation"]}]
+        out = PlaylistBuilder.buildSessionPlaylist(
+            raw_pool, 5, ["meditation"], ["Ambient"]
+        )
+        assert len(out) == 1 and out[0].id == "archive_track_01"
+
+    def test_score_track_no_matches_returns_zero(self):
+        from playlist_builder import PlaylistBuilder
+        from audio_archive_service import WellnessTrack
+
+        track = WellnessTrack("id1", "Jazz Piano Trio", "x", 200, "u")
+        assert PlaylistBuilder.score_track(track, ["loud"], ["sleep"], ["Drone"]) == 0
+
+    def test_build_session_playlist_skips_oversize_track(self):
+        from playlist_builder import PlaylistBuilder
+        from audio_archive_service import WellnessTrack
+
+        big = WellnessTrack("big", "Ambient Meditation Drone", "x", 1000, "u")
+        small = WellnessTrack("small", "Ambient Meditation Light", "x", 120, "u")
+        raw_pool = [
+            {"doc": big, "subjects": ["meditation"]},
+            {"doc": small, "subjects": ["meditation"]},
+        ]
+        # 3 min budget = 180s. Big (1000s) skipped; small (120s) fits.
+        out = PlaylistBuilder.build_session_playlist(
+            raw_pool, 3, ["meditation"], []
+        )
+        assert [t.id for t in out] == ["small"]
+
+
+# ---------- Integration: musicPreferences flows through generate ----------
+
+class TestMusicPreferencesPipeline:
+    def test_generate_respects_session_duration_budget(self, session):
+        """Sum of returned durations should fit session budget (allow safety-net of top-2 from pool)."""
+        payload = {
+            "currentMood": "Anxious",
+            "intensity": 4,
+            "musicPreferences": ["Ambient"],
+            "sessionDuration": 10,
+        }
+        r = session.post(f"{API}/music-wellness/generate", json=payload, timeout=HTTP_TIMEOUT)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        budget_sec = data["sessionDuration"] * 60
+        total = sum(t["duration"] for t in data["tracks"])
+        # Allow generous tolerance: if pool tracks all exceed budget, server falls back
+        # to top-2 scored tracks (which may exceed the budget). Otherwise must fit.
+        assert len(data["tracks"]) > 0
+        if len(data["tracks"]) > 2:
+            assert total <= budget_sec, (
+                f"Greedy assembly exceeded budget: {total}s > {budget_sec}s"
+            )
